@@ -1,4 +1,5 @@
 from base64 import b32encode
+import collections
 import contextlib
 from functools import wraps
 import json
@@ -9,6 +10,7 @@ import typing
 from hashlib import sha1
 
 import numpy as np
+import pandas as pd
 import numba
 import dill
 
@@ -139,10 +141,17 @@ def merged_dtype(dtypes):
 @export
 def merge_arrs(arrs):
     """Merge structured arrays of equal length.
-
     On field name collisions, data from later arrays is kept.
+
+    If you pass one array, it is returned without copying.
+    TODO: hmm... inconsistent
+
+    Much faster than the similar function in numpy.lib.recfunctions.
     """
-    # Much faster than the similar function in numpy.lib.recfunctions
+    if not len(arrs):
+        raise RuntimeError("Cannot merge 0 arrays")
+    if len(arrs) == 1:
+        return arrs[0]
 
     n = len(arrs[0])
     if not all([len(x) == n for x in arrs]):
@@ -201,6 +210,10 @@ def to_str_tuple(x) -> typing.Tuple[str]:
         return tuple(x)
     elif isinstance(x, tuple):
         return x
+    elif isinstance(x, pd.Series):
+        return tuple(x.values.tolist())
+    elif isinstance(x, np.ndarray):
+        return tuple(x.tolist())
     raise TypeError(f"Expected string or tuple of strings, got {type(x)}")
 
 
@@ -259,14 +272,104 @@ def formatted_exception():
 
 
 @export
-def print_entry(d, n=0, show_data=False):
-    """ Print entry number n in human-readable format.
-    Default behavior is to skip the entry 'data' since it clutters output.
+def print_record(x, skip_array=True):
+    """Print record(s) d in human-readable format
+    :param skip_array: Omit printing array fields
     """
+    if len(x.shape):
+        for q in x:
+            print_record(q)
+
     # Check what number of spaces required for nice alignment
-    max_len = np.max([len(key) for key in d.dtype.names])
-    el = d[n]
-    for key in d.dtype.names:
-        if (show_data or key != 'data'):
-            print(("{:<%d}: " % max_len).format(key), el[key])
-    return
+    max_len = np.max([len(key) for key in x.dtype.names])
+    for key in x.dtype.names:
+        try:
+            len(x[key])
+        except TypeError:
+            # Not an array field
+            pass
+        else:
+            if skip_array:
+                continue
+
+        print(("{:<%d}: " % max_len).format(key), x[key])
+
+
+@export
+def count_tags(ds):
+    """Return how often each tag occurs in the datasets DataFrame ds"""
+    from collections import Counter
+    from itertools import chain
+    all_tags = chain(*[ts.split(',')
+                       for ts in ds['tags'].values])
+    return Counter(all_tags)
+
+
+@export
+def flatten_dict(d, separator=':', _parent_key=''):
+    """Flatten nested dictionaries into a single dictionary,
+    indicating levels by separator.
+    Don't set _parent_key argument, this is used for recursive calls.
+    Stolen from http://stackoverflow.com/questions/6027558
+    """
+    items = []
+    for k, v in d.items():
+        new_key = _parent_key + separator + k if _parent_key else k
+        if isinstance(v, collections.MutableMapping):
+            items.extend(flatten_dict(v,
+                                      separator=separator,
+                                      _parent_key=new_key).items())
+        else:
+            items.append((new_key, v))
+    return dict(items)
+
+
+@export
+def to_numpy_dtype(field_spec):
+    if isinstance(field_spec, np.dtype):
+        return field_spec
+
+    dtype = []
+    for x in field_spec:
+        if len(x) == 3:
+            if isinstance(x[0], tuple):
+                # Numpy syntax for array field
+                dtype.append(x)
+            else:
+                # Lazy syntax for normal field
+                field_name, field_type, comment = x
+                dtype.append(((comment, field_name), field_type))
+        elif len(x) == 2:
+            # (field_name, type)
+            dtype.append(x)
+        elif len(x) == 1:
+            # Omitted type: assume float
+            dtype.append((x, np.float))
+        else:
+            raise ValueError(f"Invalid field specification {x}")
+    return np.dtype(dtype)
+
+
+@export
+def dict_to_rec(x, dtype=None):
+    """Convert dictionary {field_name: array} to record array
+    Optionally, provide dtype
+    """
+    if isinstance(x, np.ndarray):
+        return x
+
+    if dtype is None:
+        if not len(x):
+            raise ValueError("Cannot infer dtype from empty dict")
+        dtype = to_numpy_dtype([(k, v.dtype)
+                                for k, v in x])
+
+    if not len(x):
+        return np.empty(0, dtype=dtype)
+
+    some_key = list(x.keys())[0]
+    n = len(x[some_key])
+    r = np.zeros(n, dtype=dtype)
+    for k, v in x.items():
+        r[k] = v
+    return r

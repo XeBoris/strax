@@ -83,11 +83,15 @@ class StorageFrontend:
     For example, a runs database, or a data directory on the file system.
     """
     backends: list
+    can_define_runs = False
+    provide_run_metadata = False
 
     def __init__(self,
                  readonly=False,
+                 provide_run_metadata=None,
                  overwrite='if_broken',
-                 take_only=tuple(), exclude=tuple()):
+                 take_only=tuple(),
+                 exclude=tuple()):
         """
         :param readonly: If True, throws CannotWriteData whenever saving is
         attempted.
@@ -97,6 +101,8 @@ class StorageFrontend:
          - 'always': Always overwrite data. Use with caution!
         :param take_only: Provide/accept only these data types.
         :param exclude: Do NOT provide/accept these data types.
+        :param provide_run_metadata: Whether to provide run-level metadata
+        (run docs). If None, use class-specific default
 
         If take_only and exclude are both omitted, provide all data types.
         If a data type is listed in both, it will not be provided.
@@ -108,6 +114,8 @@ class StorageFrontend:
         self.take_only = strax.to_str_tuple(take_only)
         self.exclude = strax.to_str_tuple(exclude)
         self.overwrite = overwrite
+        if provide_run_metadata is not None:
+            self.provide_run_metadata = provide_run_metadata
         self.readonly = readonly
         self.log = logging.getLogger(self.__class__.__name__)
 
@@ -175,7 +183,7 @@ class StorageFrontend:
         {data_type: (plugin_name, version, {config_option: value, ...}, ...}
         :param write: Set to True if writing new data. The data is immediately
         registered, so you must follow up on the write!
-        :param check_broken: If True, raise DataCorrupted if data has not
+        :param check_broken: If True, raise DataNotAvailable if data has not
         been complete written, or writing terminated with an exception.
         """
         message = (
@@ -218,11 +226,12 @@ class StorageFrontend:
             # Get the metadata to check if the data is broken
             meta = self._get_backend(backend_name).get_metadata(backend_key)
             if 'exception' in meta:
-                raise DataCorrupted(
+                exc = meta['exception']
+                raise DataNotAvailable(
                     f"Data in {backend_name} {backend_key} corrupted due to "
-                    f"exception uring writing: {meta['exception']}.")
+                    f"exception during writing: {exc}.")
             if 'writing_ended' not in meta and not allow_incomplete:
-                raise DataCorrupted(
+                raise DataNotAvailable(
                     f"Data in {backend_name} {backend_key} corrupted. No "
                     f"writing_ended field present!")
 
@@ -261,28 +270,36 @@ class StorageFrontend:
             return True
         if self.overwrite == 'if_broken':
             metadata = self.get_metadata(key)
-            return ('writing_ended' in metadata
-                    and 'exception' not in metadata)
+            return not  ('writing_ended' in metadata
+                         and 'exception' not in metadata)
         return False
 
-    def list_available(self, key: DataKey,
-                       allow_incomplete, fuzzy_for, fuzzy_for_options):
-        """Return list of run_ids for which available data matches key.
-        The run_id field of key is ignored."""
-        if not self._we_take(key.data_type):
-            return []
-        return self._list_available(
-            key, allow_incomplete, fuzzy_for, fuzzy_for_options)
+    def find_several(self, keys, **kwargs):
+        """Return list with backend keys or False
+        for several data keys.
+
+        Options are as for find()
+        """
+        # You can override this if the backend has a smarter way
+        # of checking availability (e.g. a single DB query)
+        result = []
+        for key in keys:
+            try:
+                r = self.find(key, **kwargs)
+            except (strax.DataNotAvailable,
+                    strax.DataCorrupted):
+                r = False
+            result.append(r)
+        return result
 
     ##
     # Abstract methods (to override in child)
     ##
 
-    def _list_available(self, key: DataKey,
-                        allow_incomplete, fuzzy_for, fuzzy_for_options):
-        """Return list of available runs whose data matches key.
-        The run_id field of key is ignored."""
-        raise NotImplementedError
+    def _scan_runs(self, store_fields):
+        """Iterable of run document / metadata dictionaries
+        """
+        yield from tuple()
 
     def _find(self, key: DataKey,
               write, allow_incomplete, fuzzy_for, fuzzy_for_options):
@@ -384,11 +401,14 @@ class Saver:
     Do NOT add unpickleable things as attributes (such as loggers)!
     """
     closed = False
-    prefer_rechunk = True   # If False, do not rechunk even if plugin allows it
+    allow_rechunk = True   # If False, do not rechunk even if plugin allows it
+    allow_fork = True   # If False, cannot be inlined / forked
 
     # This is set if the saver is operating in multiple processes at once
     # Do not set it yourself
     is_forked = False
+
+    got_exception = None
 
     def __init__(self, metadata):
         self.md = metadata
@@ -399,7 +419,7 @@ class Saver:
         """Iterate over source and save the results under key
         along with metadata
         """
-        if rechunk and self.prefer_rechunk:
+        if rechunk and self.allow_rechunk:
             source = strax.fixed_size_chunks(source)
 
         pending = []
@@ -415,6 +435,15 @@ class Saver:
             # One traceback on screen is enough
             self.close(wait_for=pending)
             pass
+
+        except Exception as e:
+            # log exception for the final check
+            self.got_exception = e
+            # Throw the exception back into the mailbox
+            # (hoping that it is still listening...)
+            source.throw(e)
+            raise e
+
         finally:
             if not self.closed:
                 self.close(wait_for=pending)
